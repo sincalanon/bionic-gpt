@@ -18,10 +18,26 @@ fn cornucopia() {
     let out_dir = env::var_os("OUT_DIR").unwrap();
     let file_path = Path::new(&out_dir).join("cornucopia");
 
-    let db_url = env::var_os("DATABASE_URL").unwrap();
-
     // Rerun this build script if the queries or migrations change.
     println!("cargo:rerun-if-changed={queries_path}");
+    println!("cargo:rerun-if-env-changed=CORNUCOPIA_PREGENERATED");
+
+    // Offline builds (for example the Windows installer build): use code that
+    // was generated earlier by `cornucopia live` against a migrated database.
+    // CORNUCOPIA_PREGENERATED points at the generated crate directory
+    // (the folder that contains `src/lib.rs`).
+    if let Some(pregenerated) = env::var_os("CORNUCOPIA_PREGENERATED") {
+        let src = Path::new(&pregenerated).join("src").join("lib.rs");
+        println!("cargo:rerun-if-changed={}", src.display());
+        let dest_dir = file_path.join("src");
+        std::fs::create_dir_all(&dest_dir).unwrap();
+        std::fs::copy(&src, dest_dir.join("lib.rs")).unwrap_or_else(|e| {
+            panic!("Could not copy pregenerated cornucopia code from {}: {e}", src.display())
+        });
+        return;
+    }
+
+    let db_url = env::var_os("DATABASE_URL").unwrap();
 
     // Call cornucopia. Use whatever CLI command you need.
     let output = std::process::Command::new("cornucopia")

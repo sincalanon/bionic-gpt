@@ -1,0 +1,207 @@
+name: Windows Installer
+
+# Builds Bionic for Windows and packages it as a one-click Setup.exe that
+# bundles PostgreSQL + pgvector, dbmate migrations and the Bionic services.
+#
+#  1. codegen (Linux):  apply migrations to a pgvector database, run
+#     `cornucopia live` to generate the typed SQL code, and build the web
+#     assets (npm/parcel/tailwind). Both outputs are platform independent.
+#  2. windows:          compile the Rust binaries with the pregenerated code,
+#     build pgvector against a portable PostgreSQL, and run Inno Setup.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version shown in the installer (default: from the latest tag or 1.13.8)'
+        required: false
+  push:
+    branches:
+      - windows-installer
+    tags:
+      - 'win-v*'
+
+permissions:
+  contents: write
+
+env:
+  PG_ZIP_VERSION: 17.11-1
+  PGVECTOR_VERSION: v0.8.7
+  DBMATE_VERSION: v2.38.2
+
+jobs:
+  codegen:
+    runs-on: ubuntu-latest
+    container:
+      image: purtontech/rust-on-nails-devcontainer:1.3.46
+      options: --user root
+    services:
+      postgres:
+        image: ankane/pgvector
+        env:
+          POSTGRES_PASSWORD: testpassword
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      DATABASE_URL: postgresql://postgres:testpassword@postgres:5432/postgres?sslmode=disable
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Tool versions
+        run: |
+          which dbmate cornucopia node npm tailwind-extra || true
+          cornucopia --version || true
+
+      - name: Apply migrations
+        run: dbmate --wait --no-dump-schema --migrations-dir crates/db/migrations up
+
+      - name: Generate cornucopia code
+        run: |
+          mkdir -p gen
+          cornucopia live -q crates/db/queries -d gen/cornucopia "$DATABASE_URL"
+          ls -R gen | head -20
+
+      - name: Build web assets
+        run: |
+          npm --prefix crates/web-assets install
+          npm --prefix crates/web-assets run release
+          ls crates/web-assets/dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: codegen
+          path: |
+            gen/
+            crates/web-assets/dist/
+          if-no-files-found: error
+
+  windows:
+    needs: codegen
+    runs-on: windows-2022
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: codegen
+          path: codegen
+
+      - name: Place generated files
+        run: |
+          New-Item -ItemType Directory -Force crates/web-assets/dist | Out-Null
+          Copy-Item -Recurse -Force codegen/crates/web-assets/dist/* crates/web-assets/dist/
+          "CORNUCOPIA_PREGENERATED=$env:GITHUB_WORKSPACE\codegen\gen\cornucopia" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          Get-ChildItem -Recurse codegen | Select-Object -First 20 FullName
+
+      - name: Version
+        run: |
+          $v = '${{ github.event.inputs.version }}'
+          if (-not $v -and '${{ github.ref_type }}' -eq 'tag') { $v = '${{ github.ref_name }}'.Replace('win-v','') }
+          if (-not $v) { $v = '1.13.8' }
+          "BIONIC_VERSION=$v" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: ilammy/setup-nasm@v1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-release
+
+      - name: Build web-server
+        run: cargo build --release --locked -p web-server
+
+      - name: Build rag-engine
+        id: rag
+        continue-on-error: true
+        run: cargo build --release --locked -p rag-engine
+
+      - name: Build cron
+        id: cron
+        continue-on-error: true
+        run: cargo build --release --locked -p cron
+
+      - name: Download portable PostgreSQL
+        run: |
+          curl.exe -fsSL -o pg.zip "https://get.enterprisedb.com/postgresql/postgresql-$env:PG_ZIP_VERSION-windows-x64-binaries.zip"
+          Expand-Archive pg.zip -DestinationPath C:\ -Force
+          Get-ChildItem C:\pgsql
+
+      - uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Build pgvector
+        shell: cmd
+        run: |
+          git clone --depth 1 --branch %PGVECTOR_VERSION% https://github.com/pgvector/pgvector.git C:\pgvector
+          cd /d C:\pgvector
+          set "PGROOT=C:\pgsql"
+          nmake /NOLOGO /F Makefile.win || exit /b 1
+          nmake /NOLOGO /F Makefile.win install || exit /b 1
+          dir C:\pgsql\lib\vector.dll
+
+      - name: Stage files
+        run: |
+          $stage = 'C:\stage'
+          New-Item -ItemType Directory -Force $stage, "$stage\pgsql" | Out-Null
+
+          # Bionic binaries
+          foreach ($b in 'web-server','rag-engine','cron') {
+            $p = "target\release\$b.exe"
+            if (Test-Path $p) { Copy-Item $p $stage } else { Write-Warning "$b.exe not built, skipping" }
+          }
+
+          # PostgreSQL runtime (bin/lib/share only)
+          foreach ($d in 'bin','lib','share') { Copy-Item -Recurse "C:\pgsql\$d" "$stage\pgsql\$d" }
+          Get-ChildItem -Recurse "$stage\pgsql" -Include *.pdb,*.lib | Remove-Item -Force
+          Remove-Item -Recurse -Force "$stage\pgsql\bin\pgAdmin*","$stage\pgsql\bin\stackbuilder*" -ErrorAction SilentlyContinue
+
+          # MSVC runtime for PostgreSQL and the Rust binaries
+          foreach ($dll in 'vcruntime140.dll','vcruntime140_1.dll','msvcp140.dll') {
+            $src = "$env:WINDIR\System32\$dll"
+            if (-not (Test-Path "$stage\pgsql\bin\$dll")) { Copy-Item $src "$stage\pgsql\bin\" }
+            Copy-Item $src $stage -Force
+          }
+
+          # dbmate + migrations
+          curl.exe -fsSL -o "$stage\dbmate.exe" "https://github.com/amacneil/dbmate/releases/download/$env:DBMATE_VERSION/dbmate-windows-amd64.exe"
+          Copy-Item -Recurse crates\db\migrations "$stage\migrations"
+
+          # launcher scripts, icon, licence
+          Copy-Item packaging\windows\start-bionic.ps1, packaging\windows\stop-bionic.ps1, packaging\windows\bionic.ico $stage
+          Copy-Item LICENCE "$stage\LICENCE.txt"
+
+          "{0:N0} MB staged" -f ((Get-ChildItem -Recurse $stage | Measure-Object Length -Sum).Sum / 1MB)
+
+      - name: Smoke test (start database, migrate, start web-server)
+        run: |
+          & C:\stage\start-bionic.ps1 -NoBrowser
+          if ($LASTEXITCODE -ne 0) { Get-ChildItem C:\ProgramData\Bionic\logs | ForEach-Object { "== $($_.Name)"; Get-Content $_.FullName -Tail 60 }; exit 1 }
+          $r = Invoke-WebRequest -UseBasicParsing -MaximumRedirection 5 http://localhost:7703/ -SkipHttpErrorCheck
+          "HTTP $($r.StatusCode)"
+          Get-ChildItem C:\ProgramData\Bionic\logs | ForEach-Object { "== $($_.Name)"; Get-Content $_.FullName -Tail 30 }
+          & C:\stage\stop-bionic.ps1
+          if ($r.StatusCode -ge 500) { exit 1 }
+
+      - name: Build installer
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { choco install innosetup -y --no-progress; }
+          & $iscc /Qp "/DAppVersion=$env:BIONIC_VERSION" "/DStageDir=C:\stage" packaging\windows\bionic.iss
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          Get-ChildItem packaging\windows\Output
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Bionic-Setup-${{ env.BIONIC_VERSION }}-x64
+          path: packaging/windows/Output/*.exe
+          if-no-files-found: error
+
+      - name: Publish GitHub release
+        if: github.ref_type == 'tag'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: packaging/windows/Output/*.exe
