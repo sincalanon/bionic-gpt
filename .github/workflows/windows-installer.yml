@@ -184,6 +184,9 @@ jobs:
           $url = (Get-Content C:\ProgramData\Bionic\url.txt -TotalCount 1).Trim()
           $r = Invoke-WebRequest -UseBasicParsing -MaximumRedirection 5 $url -SkipHttpErrorCheck
           "$url -> HTTP $($r.StatusCode)"
+          $l = Get-NetTCPConnection -State Listen -OwningProcess (Get-Process web-server).Id
+          $l | Format-Table LocalAddress,LocalPort
+          if ($l | Where-Object { $_.LocalAddress -ne '127.0.0.1' }) { throw 'web-server is listening beyond loopback' }
           Get-ChildItem C:\ProgramData\Bionic\logs | ForEach-Object { "== $($_.Name)"; Get-Content $_.FullName -Tail 30 }
           & C:\stage\stop-bionic.ps1
           if ($r.StatusCode -ge 500) { exit 1 }

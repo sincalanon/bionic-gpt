@@ -69,6 +69,7 @@ try {
             '# Extra environment variables for Bionic (KEY=VALUE, one per line).',
             '# Examples:',
             '# PORT=7703',
+            '# BIND_ADDRESS=127.0.0.1',
             '# LOG_LEVEL=DEBUG',
             '# KREUZBERG_API_ENDPOINT=http://localhost:3300'
         ) | Set-Content -Path $envFile -Encoding ASCII
@@ -123,6 +124,9 @@ try {
 
     $env:APP_DATABASE_URL    = "postgresql://application_user:testpassword@127.0.0.1:$PgPort/bionic-gpt?sslmode=disable"
     $env:APP_BASE_URL        = "http://localhost:$AppPort"
+    # No login is required, so only this computer may connect.
+    # To share on the LAN, set BIND_ADDRESS=0.0.0.0 in bionic.env (not recommended).
+    $env:BIND_ADDRESS        = '127.0.0.1'
     # Single local user, no login screen (same as the upstream docker-compose quick start).
     $env:DANGER_JWT_OVERRIDE = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiaWF0IjoxNTE2MjM5MDIyLCJlbWFpbCI6ImpvaG5AYWNtZS5vcmcifQ.daYgeWqnpmtorlFKjb0sdRFDcPPWfow68KRZh3uUDhc'
     foreach ($k in $custom.Keys) { Set-Item -Path "env:$k" -Value $custom[$k] }

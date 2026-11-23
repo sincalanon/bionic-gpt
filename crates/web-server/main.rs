@@ -85,7 +85,12 @@ async fn main() {
     let i18n = db::I18n::new(pool.clone());
     i18n.warm_cache().await;
     db::i18n::set_global(i18n.clone());
-    let addr = SocketAddr::from(([0, 0, 0, 0], config.port));
+    // BIND_ADDRESS lets local/desktop installs listen on loopback only.
+    let bind_ip: std::net::IpAddr = std::env::var("BIND_ADDRESS")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(std::net::IpAddr::from([0, 0, 0, 0]));
+    let addr = SocketAddr::new(bind_ip, config.port);
 
     // build our application with a route
     let app = Router::new()
