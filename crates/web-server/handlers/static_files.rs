@@ -4,7 +4,6 @@ use axum::http::{header, HeaderValue, Response, StatusCode};
 use axum::response::IntoResponse;
 use axum_extra::routing::TypedPath;
 use serde::Deserialize;
-use tokio_util::io::ReaderStream;
 
 #[derive(TypedPath, Deserialize)]
 #[typed_path("/static/{*path}")]
@@ -24,19 +23,7 @@ pub async fn static_path(StaticFilePath { path }: StaticFilePath) -> impl IntoRe
     };
 
     if let Some(data) = data {
-        let file = match tokio::fs::File::open(data.file_name).await {
-            Ok(file) => file,
-            Err(_) => {
-                return Response::builder()
-                    .status(StatusCode::NOT_FOUND)
-                    .body(Body::empty())
-                    .unwrap()
-            }
-        };
-
-        // convert the `AsyncRead` into a `Stream`
-        let stream = ReaderStream::new(file);
-
+        // Assets are embedded in the binary at build time (see web-assets/build.rs).
         return Response::builder()
             .status(StatusCode::OK)
             .header(
@@ -47,7 +34,7 @@ pub async fn static_path(StaticFilePath { path }: StaticFilePath) -> impl IntoRe
                 header::CACHE_CONTROL,
                 HeaderValue::from_static("public, max-age=31536000, immutable"),
             )
-            .body(Body::from_stream(stream))
+            .body(Body::from(data.data))
             .unwrap();
     }
     Response::builder()

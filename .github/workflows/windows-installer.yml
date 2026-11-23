@@ -114,17 +114,17 @@ jobs:
           cache-on-failure: true
 
       - name: Build web-server
-        run: cargo build --release --locked -p web-server
+        run: cargo build --release -p web-server
 
       - name: Build rag-engine
         id: rag
         continue-on-error: true
-        run: cargo build --release --locked -p rag-engine
+        run: cargo build --release -p rag-engine
 
       - name: Build cron
         id: cron
         continue-on-error: true
-        run: cargo build --release --locked -p cron
+        run: cargo build --release -p cron
 
       - name: Download portable PostgreSQL
         run: |

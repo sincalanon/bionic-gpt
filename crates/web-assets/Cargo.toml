@@ -11,5 +11,3 @@ path = "lib.rs"
 [dependencies]
 mime.workspace = true
 
-[build-dependencies]
-cache-busters = "0"
