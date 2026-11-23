@@ -1,8 +1,8 @@
 # Starts a local, single-user Bionic on Windows:
-#   1. a private PostgreSQL (with pgvector) on 127.0.0.1:54329
+#   1. a private PostgreSQL (with pgvector) on 127.0.0.1
 #   2. database migrations (dbmate)
 #   3. web-server (+ rag-engine and cron when present)
-# then opens http://localhost:7703 in the default browser.
+# then opens the app in the default browser.
 #
 # Data lives in %ProgramData%\Bionic (ASCII path, survives reinstall).
 # Settings can be overridden in %ProgramData%\Bionic\bionic.env (KEY=VALUE lines).
@@ -30,6 +30,37 @@ function Write-Log($msg) {
     Add-Content -Path (Join-Path $Logs 'launcher.log') -Value $line
 }
 
+# Windows (Hyper-V / WinNAT) reserves random port ranges; binding inside one
+# fails with "Permission denied". Pick a port we can actually bind and remember it.
+function Test-PortFree([int]$port) {
+    try {
+        $l = New-Object System.Net.Sockets.TcpListener([System.Net.IPAddress]::Loopback, $port)
+        $l.Start(); $l.Stop(); return $true
+    } catch { return $false }
+}
+
+function Select-Port([string]$name, [int]$preferred) {
+    $file = Join-Path $Root "$name.port"
+    $candidates = @()
+    if (Test-Path $file) { $candidates += [int](Get-Content $file -TotalCount 1) }
+    $candidates += $preferred
+    $rand = New-Object System.Random
+    for ($i = 0; $i -lt 40; $i++) { $candidates += $rand.Next(20000, 40000) }
+    foreach ($p in $candidates) {
+        if (Test-PortFree $p) {
+            Set-Content -Path $file -Value $p -Encoding ASCII
+            return $p
+        }
+    }
+    throw "No free TCP port found for $name"
+}
+
+function Get-SavedPort([string]$name, [int]$default) {
+    $file = Join-Path $Root "$name.port"
+    if (Test-Path $file) { return [int](Get-Content $file -TotalCount 1) }
+    return $default
+}
+
 try {
     # ---------------------------------------------------------------- settings
     $envFile = Join-Path $Root 'bionic.env'
@@ -48,7 +79,8 @@ try {
         $k, $v = $l.Split('=', 2)
         $custom[$k.Trim()] = $v.Trim()
     }
-    if ($custom.ContainsKey('PORT')) { $AppPort = [int]$custom['PORT'] }
+    $fixedAppPort = $custom.ContainsKey('PORT')
+    if ($fixedAppPort) { $AppPort = [int]$custom['PORT'] }
 
     # -------------------------------------------------------------- postgres
     $env:PATH = "$PgBin;$env:PATH"
@@ -59,7 +91,10 @@ try {
     }
 
     & (Join-Path $PgBin 'pg_ctl.exe') status -D $PgData *> $null
-    if ($LASTEXITCODE -ne 0) {
+    if ($LASTEXITCODE -eq 0) {
+        $PgPort = Get-SavedPort 'postgres' $PgPort
+    } else {
+        $PgPort = Select-Port 'postgres' $PgPort
         Write-Log "Starting PostgreSQL on port $PgPort..."
         & (Join-Path $PgBin 'pg_ctl.exe') start -D $PgData -w -t 60 -l (Join-Path $Logs 'postgres.log') -o "-p $PgPort -c listen_addresses=127.0.0.1"
         if ($LASTEXITCODE -ne 0) { throw "PostgreSQL failed to start, see $Logs\postgres.log" }
@@ -80,12 +115,18 @@ try {
     if ($LASTEXITCODE -ne 0) { throw "Migrations failed, see $Logs\migrations.log" }
 
     # ---------------------------------------------------------- app services
+    $webExe = Join-Path $App 'web-server.exe'
+    $webRunning = Get-Process -Name 'web-server' -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $webExe }
+    if (-not $fixedAppPort) {
+        if ($webRunning) { $AppPort = Get-SavedPort 'web' $AppPort } else { $AppPort = Select-Port 'web' $AppPort }
+    }
+
     $env:APP_DATABASE_URL    = "postgresql://application_user:testpassword@127.0.0.1:$PgPort/bionic-gpt?sslmode=disable"
-    $env:PORT                = "$AppPort"
     $env:APP_BASE_URL        = "http://localhost:$AppPort"
     # Single local user, no login screen (same as the upstream docker-compose quick start).
     $env:DANGER_JWT_OVERRIDE = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiaWF0IjoxNTE2MjM5MDIyLCJlbWFpbCI6ImpvaG5AYWNtZS5vcmcifQ.daYgeWqnpmtorlFKjb0sdRFDcPPWfow68KRZh3uUDhc'
     foreach ($k in $custom.Keys) { Set-Item -Path "env:$k" -Value $custom[$k] }
+    $env:PORT = "$AppPort"
 
     foreach ($svc in 'web-server', 'rag-engine', 'cron') {
         $exe = Join-Path $App "$svc.exe"
@@ -110,6 +151,7 @@ try {
     if (-not $ok) { throw "web-server did not start, see $Logs\web-server.err.log" }
 
     Write-Log "Bionic is running at $url"
+    Set-Content -Path (Join-Path $Root 'url.txt') -Value $url -Encoding ASCII
     if (-not $NoBrowser) { Start-Process $url }
     exit 0
 }

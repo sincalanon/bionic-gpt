@@ -181,8 +181,9 @@ jobs:
         run: |
           & C:\stage\start-bionic.ps1 -NoBrowser
           if ($LASTEXITCODE -ne 0) { Get-ChildItem C:\ProgramData\Bionic\logs | ForEach-Object { "== $($_.Name)"; Get-Content $_.FullName -Tail 60 }; exit 1 }
-          $r = Invoke-WebRequest -UseBasicParsing -MaximumRedirection 5 http://localhost:7703/ -SkipHttpErrorCheck
-          "HTTP $($r.StatusCode)"
+          $url = (Get-Content C:\ProgramData\Bionic\url.txt -TotalCount 1).Trim()
+          $r = Invoke-WebRequest -UseBasicParsing -MaximumRedirection 5 $url -SkipHttpErrorCheck
+          "$url -> HTTP $($r.StatusCode)"
           Get-ChildItem C:\ProgramData\Bionic\logs | ForEach-Object { "== $($_.Name)"; Get-Content $_.FullName -Tail 30 }
           & C:\stage\stop-bionic.ps1
           if ($r.StatusCode -ge 500) { exit 1 }
