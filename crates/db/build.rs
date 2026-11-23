@@ -27,11 +27,9 @@ fn cornucopia() {
     // CORNUCOPIA_PREGENERATED points at the generated crate directory
     // (the folder that contains `src/lib.rs`).
     if let Some(pregenerated) = env::var_os("CORNUCOPIA_PREGENERATED") {
-        let src = Path::new(&pregenerated).join("src").join("lib.rs");
+        let src = Path::new(&pregenerated).join("src");
         println!("cargo:rerun-if-changed={}", src.display());
-        let dest_dir = file_path.join("src");
-        std::fs::create_dir_all(&dest_dir).unwrap();
-        std::fs::copy(&src, dest_dir.join("lib.rs")).unwrap_or_else(|e| {
+        copy_dir(&src, &file_path.join("src")).unwrap_or_else(|e| {
             panic!("Could not copy pregenerated cornucopia code from {}: {e}", src.display())
         });
         return;
@@ -54,4 +52,18 @@ fn cornucopia() {
     if !output.status.success() {
         panic!("{}", &std::str::from_utf8(&output.stderr).unwrap());
     }
+}
+
+fn copy_dir(from: &Path, to: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(to)?;
+    for entry in std::fs::read_dir(from)? {
+        let entry = entry?;
+        let target = to.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_dir(&entry.path(), &target)?;
+        } else {
+            std::fs::copy(entry.path(), &target)?;
+        }
+    }
+    Ok(())
 }
