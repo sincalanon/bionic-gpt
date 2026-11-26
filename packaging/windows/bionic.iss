@@ -1,4 +1,4 @@
-; Inno Setup script for the Bionic Windows installer.
+﻿; Inno Setup script for the Bionic Windows installer.
 ; Built by .github/workflows/windows-installer.yml:
 ;   ISCC.exe /DAppVersion=1.13.8 /DStageDir=C:\stage packaging\windows\bionic.iss
 
@@ -45,6 +45,7 @@ Source: "{#StageDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs c
 [Icons]
 Name: "{group}\Start Bionic"; Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File ""{app}\start-bionic.ps1"""; WorkingDir: "{app}"; IconFilename: "{app}\bionic.ico"
 Name: "{group}\Stop Bionic"; Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File ""{app}\stop-bionic.ps1"""; WorkingDir: "{app}"
+Name: "{group}\选择 GGUF 模型"; Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File ""{app}\start-bionic.ps1"" -PickModel"; WorkingDir: "{app}"; IconFilename: "{app}\bionic.ico"
 Name: "{group}\Bionic logs"; Filename: "{commonappdata}\Bionic\logs"
 Name: "{group}\Uninstall Bionic"; Filename: "{uninstallexe}"
 Name: "{autodesktop}\Bionic"; Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File ""{app}\start-bionic.ps1"""; WorkingDir: "{app}"; IconFilename: "{app}\bionic.ico"; Tasks: desktopicon

@@ -12,6 +12,13 @@ foreach ($svc in 'web-server', 'rag-engine', 'cron') {
         Stop-Process -Force -ErrorAction SilentlyContinue
 }
 
+# bundled llama.cpp servers (local GGUF models)
+$llamaExe = Join-Path $App 'llama\llama-server.exe'
+Get-Process -Name 'llama-server' -ErrorAction SilentlyContinue |
+    Where-Object { $_.Path -eq $llamaExe } |
+    Stop-Process -Force -ErrorAction SilentlyContinue
+Remove-Item (Join-Path $env:ProgramData 'Bionic\llama-*.pid') -ErrorAction SilentlyContinue
+
 if (Test-Path (Join-Path $PgData 'PG_VERSION')) {
     & (Join-Path $PgBin 'pg_ctl.exe') stop -D $PgData -m fast -w *> $null
 }

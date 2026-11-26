@@ -1,13 +1,18 @@
-# Starts a local, single-user Bionic on Windows:
+﻿# Starts a local, single-user Bionic on Windows:
 #   1. a private PostgreSQL (with pgvector) on 127.0.0.1
 #   2. database migrations (dbmate)
-#   3. web-server (+ rag-engine and cron when present)
+#   3. local models via the bundled llama.cpp (llama-server):
+#        - an embeddings model shipped with the installer
+#        - a chat model from a GGUF file the user picks (asked on first start,
+#          or any time with -PickModel / the "选择 GGUF 模型" shortcut)
+#      both are registered in Bionic automatically
+#   4. web-server (+ rag-engine and cron when present)
 # then opens the app in the default browser.
 #
 # Data lives in %ProgramData%\Bionic (ASCII path, survives reinstall).
 # Settings can be overridden in %ProgramData%\Bionic\bionic.env (KEY=VALUE lines).
 
-param([switch]$NoBrowser)
+param([switch]$NoBrowser, [switch]$PickModel)
 
 # Native tools (initdb, pg_ctl, dbmate) write progress to stderr; with 'Stop'
 # Windows PowerShell 5.1 would turn that into terminating errors. Exit codes
@@ -55,6 +60,135 @@ function Select-Port([string]$name, [int]$preferred) {
     throw "No free TCP port found for $name"
 }
 
+# ------------------------------------------------------------ llama.cpp
+$LlamaDir = Join-Path $App 'llama'
+$LlamaExe = Join-Path $LlamaDir 'llama-server.exe'
+
+function Test-PidAlive([string]$name) {
+    $file = Join-Path $Root "llama-$name.pid"
+    if (-not (Test-Path $file)) { return $false }
+    $p = Get-Process -Id ([int](Get-Content $file -TotalCount 1)) -ErrorAction SilentlyContinue
+    return ($p -and $p.Path -eq $LlamaExe)
+}
+
+function Stop-Llama([string]$name) {
+    $file = Join-Path $Root "llama-$name.pid"
+    if (Test-PidAlive $name) { Stop-Process -Id ([int](Get-Content $file -TotalCount 1)) -Force -ErrorAction SilentlyContinue; Start-Sleep -Seconds 1 }
+    Remove-Item $file -ErrorAction SilentlyContinue
+}
+
+function Quote-Arg([string]$a) { if ($a -match '[\s"]') { return '"' + $a.Replace('"', '\"') + '"' } return $a }
+
+# Starts llama-server for one model; returns its port. Reuses a running one.
+function Start-Llama([string]$name, [string]$model, [int]$preferred, [string[]]$extra) {
+    if (Test-PidAlive $name) { return (Get-SavedPort "llama-$name" $preferred) }
+    $port = Select-Port "llama-$name" $preferred
+    $argList = @('-m', $model, '--host', '127.0.0.1', '--port', "$port") + $extra
+    $argLine = ($argList | ForEach-Object { Quote-Arg $_ }) -join ' '
+    Write-Log "Starting llama-server ($name) on port ${port}: $argLine"
+    $p = Start-Process -FilePath $LlamaExe -ArgumentList $argLine -WorkingDirectory $LlamaDir -WindowStyle Hidden -PassThru `
+        -RedirectStandardOutput (Join-Path $Logs "llama-$name.out.log") `
+        -RedirectStandardError  (Join-Path $Logs "llama-$name.err.log")
+    Set-Content -Path (Join-Path $Root "llama-$name.pid") -Value $p.Id -Encoding ASCII
+    return $port
+}
+
+# Waits until llama-server answers /health with 200 (model loaded).
+function Wait-Llama([string]$name, [int]$port, [int]$seconds) {
+    for ($i = 0; $i -lt $seconds; $i++) {
+        if (-not (Test-PidAlive $name)) { return 'exited' }
+        try {
+            $r = Invoke-WebRequest -UseBasicParsing -TimeoutSec 2 "http://127.0.0.1:$port/health"
+            if ($r.StatusCode -eq 200) { return 'ready' }
+        } catch { }
+        Start-Sleep -Seconds 1
+    }
+    return 'loading'
+}
+
+function Sql-Text([string]$v) { return "'" + $v.Replace("'", "''") + "'" }
+
+# Creates or updates the model row Bionic uses for a local llama-server.
+function Register-Model([string]$name, [string]$type, [string]$display, [int]$port, [int]$ctx) {
+    $url = Sql-Text "http://127.0.0.1:$port/v1"
+    $n = Sql-Text $name; $d = Sql-Text $display
+    $sql = @"
+UPDATE model_registry.models SET base_url = $url, context_size = $ctx, display_name = $d, provider_type = 'OpenAICompatible', updated_at = NOW()
+ WHERE name = $n AND model_type = '$type';
+INSERT INTO model_registry.models (name, model_type, provider_type, base_url, api_key, tpm_limit, rpm_limit, context_size, display_name, description)
+SELECT $n, '$type', 'OpenAICompatible', $url, 'local', 10000000, 10000000, $ctx, $d, 'Local GGUF model served by the bundled llama.cpp'
+ WHERE NOT EXISTS (SELECT 1 FROM model_registry.models WHERE name = $n AND model_type = '$type');
+"@
+    $sqlFile = Join-Path $Root 'register-model.sql'
+    Set-Content -Path $sqlFile -Value $sql -Encoding UTF8
+    & $psql -h 127.0.0.1 -p $PgPort -U postgres -d bionic-gpt -v ON_ERROR_STOP=1 -q -f $sqlFile *>> (Join-Path $Logs 'register-model.log')
+    if ($LASTEXITCODE -ne 0) { throw "Could not register model $name, see $Logs\register-model.log" }
+}
+
+function Show-GgufPicker {
+    Add-Type -AssemblyName System.Windows.Forms
+    $owner = New-Object System.Windows.Forms.Form -Property @{ TopMost = $true; ShowInTaskbar = $false; WindowState = 'Minimized' }
+    $dlg = New-Object System.Windows.Forms.OpenFileDialog
+    $dlg.Title = 'Bionic - 选择本地 GGUF 对话模型（取消则跳过）'
+    $dlg.Filter = 'GGUF 模型 (*.gguf)|*.gguf|所有文件 (*.*)|*.*'
+    $ok = $dlg.ShowDialog($owner)
+    $owner.Dispose()
+    if ($ok -eq [System.Windows.Forms.DialogResult]::OK) { return $dlg.FileName }
+    return $null
+}
+
+function Show-Info([string]$text) {
+    if ($env:CI) { return }
+    Add-Type -AssemblyName PresentationFramework -ErrorAction SilentlyContinue
+    [System.Windows.MessageBox]::Show($text, 'Bionic') | Out-Null
+}
+
+function Start-LocalModels {
+    if (-not (Test-Path $LlamaExe)) { Write-Log 'llama-server not bundled, skipping local models'; return }
+
+    # Embeddings: Bionic needs one before chat is enabled.
+    $embedModel = Get-ChildItem (Join-Path $App 'models') -Filter *.gguf -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($embedModel) {
+        $ePort = Start-Llama 'embed' $embedModel.FullName 8081 @('--embeddings', '-c', '512', '-b', '512', '-ub', '512', '-ngl', '0')
+        Register-Model 'bionic-local-embeddings' 'Embeddings' "Local Embeddings ($($embedModel.BaseName))" $ePort 512
+    }
+
+    # Chat model from a GGUF the user picked.
+    $ggufFile = Join-Path $Root 'gguf.txt'
+    $skipFile = Join-Path $Root 'gguf.skip'
+    $gguf = $null
+    if ($env:BIONIC_GGUF) { $gguf = $env:BIONIC_GGUF }
+    elseif (Test-Path $ggufFile) { $gguf = (Get-Content $ggufFile -TotalCount 1 -Encoding UTF8).Trim() }
+
+    $ask = $PickModel -or ((-not $gguf -or -not (Test-Path -LiteralPath $gguf)) -and -not (Test-Path $skipFile))
+    if ($ask -and -not $env:CI) {
+        $picked = Show-GgufPicker
+        if ($picked) {
+            $gguf = $picked
+            Set-Content -Path $ggufFile -Value $gguf -Encoding UTF8
+            Remove-Item $skipFile -ErrorAction SilentlyContinue
+            Stop-Llama 'chat'
+        } elseif (-not $PickModel) {
+            Set-Content -Path $skipFile -Value 'skipped' -Encoding ASCII
+        }
+    }
+    if (-not $gguf -or -not (Test-Path -LiteralPath $gguf)) { Write-Log 'No GGUF chat model selected'; return }
+
+    $ctx = 8192
+    if ($custom.ContainsKey('LLAMA_CTX')) { $ctx = [int]$custom['LLAMA_CTX'] }
+    $extra = @('-c', "$ctx", '--jinja')
+    if ($custom.ContainsKey('LLAMA_ARGS')) { $extra += ($custom['LLAMA_ARGS'] -split '\s+' | Where-Object { $_ }) }
+    $cPort = Start-Llama 'chat' $gguf 8080 $extra
+    Register-Model 'bionic-local-gguf' 'LLM' ([System.IO.Path]::GetFileNameWithoutExtension($gguf)) $cPort $ctx
+
+    # Catch an immediate failure (bad file, out of memory) without waiting for a large model to load.
+    $state = Wait-Llama 'chat' $cPort 8
+    if ($state -eq 'exited') {
+        Write-Log "llama-server (chat) exited, see $Logs\llama-chat.err.log"
+        Show-Info "本地模型启动失败：`n$gguf`n`n可能是文件损坏、内存/显存不足或格式不受支持。`n日志：$Logs\llama-chat.err.log`n`n可从开始菜单「选择 GGUF 模型」换一个。"
+    }
+}
+
 function Get-SavedPort([string]$name, [int]$default) {
     $file = Join-Path $Root "$name.port"
     if (Test-Path $file) { return [int](Get-Content $file -TotalCount 1) }
@@ -71,7 +205,10 @@ try {
             '# PORT=7703',
             '# BIND_ADDRESS=127.0.0.1',
             '# LOG_LEVEL=DEBUG',
-            '# KREUZBERG_API_ENDPOINT=http://localhost:3300'
+            '# KREUZBERG_API_ENDPOINT=http://localhost:3300',
+            '# Local GGUF chat model (llama.cpp):',
+            '# LLAMA_CTX=8192',
+            '# LLAMA_ARGS=-ngl 99 -t 8'
         ) | Set-Content -Path $envFile -Encoding ASCII
     }
     $custom = @{}
@@ -114,6 +251,9 @@ try {
     $env:DATABASE_URL = "postgresql://postgres@127.0.0.1:$PgPort/bionic-gpt?sslmode=disable"
     & (Join-Path $App 'dbmate.exe') --no-dump-schema --migrations-dir (Join-Path $App 'migrations') up *>> (Join-Path $Logs 'migrations.log')
     if ($LASTEXITCODE -ne 0) { throw "Migrations failed, see $Logs\migrations.log" }
+
+    # ---------------------------------------------------------- local models
+    Start-LocalModels
 
     # ---------------------------------------------------------- app services
     $webExe = Join-Path $App 'web-server.exe'
